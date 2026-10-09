@@ -357,4 +357,89 @@
 
 {% endif %}
 
+<script>
+function toggleShareMenu() {
+    const menu = document.getElementById("shareMenu");
+    if (!menu) return;
+
+    const isOpen = menu.style.display === "block";
+    menu.style.display = isOpen ? "none" : "block";
+}
+
+function closeShareMenu() {
+    const menu = document.getElementById("shareMenu");
+    if (menu) {
+        menu.style.display = "none";
+    }
+}
+
+function shareWhatsApp() {
+    const input = document.getElementById("refLink");
+    if (!input) return;
+
+    const message = encodeURIComponent(
+        "Join me on Veylin: " + input.value
+    );
+
+    closeShareMenu();
+
+    window.open(
+        "https://wa.me/?text=" + message,
+        "_blank",
+        "noopener,noreferrer"
+    );
+}
+
+function shareEmail() {
+    const input = document.getElementById("refLink");
+    if (!input) return;
+
+    const subject = encodeURIComponent("Join me on Veylin");
+    const body = encodeURIComponent(
+        "I'd like to invite you to Veylin: " + input.value
+    );
+
+    const gmailUrl =
+        "https://mail.google.com/mail/?view=cm&fs=1" +
+        "&su=" + subject +
+        "&body=" + body;
+
+    closeShareMenu();
+
+    window.open(
+        gmailUrl,
+        "_blank",
+        "noopener,noreferrer"
+    );
+}
+
+
+async function copyReferral(button) {
+    const input = document.getElementById("refLink");
+    if (!input) return;
+
+    try {
+        await navigator.clipboard.writeText(input.value);
+        button.textContent = "Copied!";
+    } catch (error) {
+        input.select();
+        input.setSelectionRange(0, input.value.length);
+
+        const copied = document.execCommand("copy");
+        button.textContent = copied ? "Copied!" : "Copy failed";
+    }
+
+    // Keep the dropdown open so the user can see the confirmation.
+    setTimeout(() => {
+        button.textContent = "Copy Link";
+
+        // Close the menu after the confirmation has been displayed.
+        closeShareMenu();
+    }, 2000);
+}
+
+</script>
+
+
+
 {% endblock %}
