@@ -176,7 +176,7 @@ class AffiliateAdmin(admin.ModelAdmin):
 
     def monthly_payout_display(self, obj):
         return f"£{obj.monthly_payout():.2f}"
-    monthly_payout_display.short_description = "Monthly Payout"
+    monthly_payout_display.short_description = "Total Earned Commission"
 
     # ✅ FIXED: proper indentation + writer usage
     def export_affiliate_payouts(self, request, queryset):

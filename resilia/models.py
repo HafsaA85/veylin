@@ -30,12 +30,12 @@ class Subscription(models.Model):
 
     stripe_customer_id = models.CharField(max_length=255, blank=True, null=True)
     stripe_subscription_id = models.CharField(max_length=255, blank=True, null=True)
-    
+
     def is_trial_active(self):
         if not self.trial_start:
             return False
         return timezone.now() <= self.trial_start + timedelta(days=7)
-        
+
     def __str__(self):
         return f"{self.user.username} Subscription"
 
@@ -185,7 +185,7 @@ class AccessCode(models.Model):
 
     def __str__(self):
         return self.code
-    
+
 class ExerciseCompletion(models.Model):
      user = models.ForeignKey("auth.User", on_delete=models.CASCADE)
      exercise = models.ForeignKey("CBTExercise", on_delete=models.CASCADE)
@@ -242,9 +242,16 @@ class Affiliate(models.Model):
             is_active=True
         ).count()
 
-    # ✅ ADD THIS
     def monthly_payout(self):
-        return self.active_users_count() * 1.0
+        from django.db.models import Sum
+
+        total = self.commissions.filter(
+            status="earned"
+        ).aggregate(
+            total=Sum("commission_amount")
+        )["total"]
+
+        return total or 0
 
 
 @receiver(post_save, sender=User)
@@ -252,4 +259,48 @@ def create_affiliate_for_user(sender, instance, created, **kwargs):
     if created:
         Affiliate.objects.create(
             user=instance
+        )
+
+
+class AffiliateCommission(models.Model):
+    affiliate = models.ForeignKey(
+        'Affiliate',
+        on_delete=models.PROTECT,
+        related_name='commissions'
+    )
+    referred_subscription = models.ForeignKey(
+        'Subscription',
+        on_delete=models.PROTECT,
+        related_name='affiliate_commissions'
+    )
+    stripe_invoice_id = models.CharField(
+        max_length=255,
+        unique=True
+    )
+    payment_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2
+    )
+    commission_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2
+    )
+    status = models.CharField(
+        max_length=20,
+        default='earned'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['referred_subscription'],
+                name='unique_affiliate_commission_per_subscription'
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.affiliate.code} - "
+            f"£{self.commission_amount} commission"
         )

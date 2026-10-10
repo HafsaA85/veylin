@@ -9,6 +9,7 @@ from django.contrib import messages
 from django.utils import timezone
 from datetime import timedelta
 from django.db.models import Avg, Count
+from django.db import transaction, IntegrityError
 from django.conf import settings
 from functools import wraps
 from .models import AnxietyTrigger, JournalEntry, Subscription, OrganisationLead, CBTExercise, ExerciseCompletion
@@ -35,7 +36,7 @@ from django.utils.http import (urlsafe_base64_encode, urlsafe_base64_decode,)
 from django.utils.encoding import force_bytes
 from .emails import (send_verification_email, add_user_to_brevo)
 from django.contrib.auth import get_user_model
-from .models import UserProfile
+from .models import UserProfile, AffiliateCommission
 
 User = get_user_model()
 
@@ -150,10 +151,10 @@ def premium_required(view_func):
              return redirect("resilia:upgrade")
 
         return view_func(request, *args, **kwargs)
-        
+
     return wrapper
-    
-    
+
+
 # =========================
 # CONTACT
 # =========================
@@ -324,7 +325,7 @@ def home(request):
 
     else:
         affirmation = "You’re doing better than you think."
-    
+
     max_intensity = triggers.aggregate(Max("intensity"))["intensity__max"] or 0
 
     if max_intensity >= 9:
@@ -364,7 +365,7 @@ def home(request):
         exercise = CBTExercise.objects.filter(
         mood_level="moderate"
     ).first()
-        
+
     show_banner = should_show_support_banner(request)
     return render(
         request,
@@ -392,7 +393,7 @@ def complete_exercise(request, pk):
             user=request.user,
             exercise=exercise
         )
-        
+
         exercise = CBTExercise.objects.first()
 
         return JsonResponse({"status": "success"})
@@ -535,7 +536,7 @@ def verify_email(request, uidb64, token):
     )
 
     return redirect("resilia:register")
-    
+
 
 
 def login_view(request):
@@ -610,7 +611,7 @@ def tracker_create(request):
             profile.last_mood_entry = timezone.now()
 
             profile.save()
-            
+
             text_to_check = " ".join([
                 getattr(trigger, "situation", "") or "",
                 getattr(trigger, "thought", "") or "",
@@ -824,7 +825,7 @@ def customer_portal(request):
         sub = Subscription.objects.get(user=request.user)
     except Subscription.DoesNotExist:
         return redirect("resilia:upgrade")
-    
+
     # ✅ If user has free access → no Stripe portal
     if sub.free_access:
         messages.info(request, "You have free access. No subscription to manage.")
@@ -843,7 +844,7 @@ def customer_portal(request):
 
     # ❌ Only if no Stripe customer → checkout
     return redirect("resilia:upgrade")
-    
+
 # =========================
 # STRIPE
 # =========================
@@ -875,7 +876,10 @@ def create_checkout_session(request):
             "quantity": 1,
         }],
         subscription_data={
-            "trial_period_days": trial_period_days
+            "trial_period_days": trial_period_days,
+            "metadata": {
+                "user_id": str(request.user.id)
+            }
         },
         success_url=domain_url + "success/?session_id={CHECKOUT_SESSION_ID}",
         cancel_url=domain_url + "upgrade/",
@@ -901,7 +905,7 @@ def upgrade(request):
     return render(request, "upgrade.html", {
         "trial_available": trial_available
     })
-    
+
 
 def subscription_success(request):
     session_id = request.GET.get("session_id")
@@ -975,27 +979,162 @@ def stripe_webhook(request):
         except Subscription.DoesNotExist:
             print("⚠️ Subscription not found:", user_id)
 
+
     # =========================
     # PAYMENT SUCCEEDED
     # =========================
+
     elif event_type == "invoice.payment_succeeded":
         customer_id = data.get("customer")
         subscription_id = data.get("subscription")
 
+        # Support newer Stripe invoice structures.
+        parent = data.get("parent") or {}
+        subscription_details = (
+            parent.get("subscription_details") or {}
+        )
+
+        if not subscription_id:
+            subscription_id = subscription_details.get("subscription")
+
         try:
-            sub = Subscription.objects.get(stripe_customer_id=customer_id)
-
-            sub.is_active = True
-
-            if subscription_id:
-                sub.stripe_subscription_id = subscription_id
-
-            sub.save()
-
-            print("✅ Payment succeeded:", customer_id)
+            sub = Subscription.objects.get(
+                stripe_customer_id=customer_id
+            )
 
         except Subscription.DoesNotExist:
-            print("⚠️ Subscription not found:", customer_id)
+            # Recover the user ID from the Stripe Subscription itself.
+            if not subscription_id:
+                print("Cannot recover subscription: missing subscription ID.")
+                return HttpResponse(status=500)
+
+            try:
+                stripe_sub = stripe.Subscription.retrieve(subscription_id)
+            except stripe.StripeError as exc:
+                print("Stripe subscription lookup failed:", exc)
+                return HttpResponse(status=500)
+
+            metadata = stripe_sub.get("metadata") or {}
+            user_id = metadata.get("user_id")
+
+            if not user_id:
+                print(
+                    "Stripe Subscription has no user_id metadata:",
+                    subscription_id,
+                )
+                return HttpResponse(status=500)
+
+            try:
+                sub = Subscription.objects.get(user_id=int(user_id))
+            except (Subscription.DoesNotExist, ValueError, TypeError):
+                print("Local subscription not found for user:", user_id)
+                return HttpResponse(status=500)
+
+            sub.stripe_customer_id = customer_id
+
+
+        sub.is_active = True
+        if subscription_id:
+            sub.stripe_subscription_id = subscription_id
+        sub.save()
+
+        print("Payment succeeded:", customer_id)
+
+        amount_paid = int(data.get("amount_paid") or 0)
+        invoice_id = data.get("id")
+        currency = (data.get("currency") or "").lower()
+
+        # Only consider positive GBP payments for a subscription.
+        if (
+            amount_paid > 0
+            and invoice_id
+            and currency == "gbp"
+            and subscription_id
+        ):
+            affiliate = sub.referred_by
+
+            if not affiliate or affiliate.user_id == sub.user_id:
+                print("No commission: missing affiliate or self-referral.")
+            else:
+                from decimal import Decimal
+
+                try:
+                    paid_invoices = [
+                        invoice
+                        for invoice in stripe.Invoice.list(
+                            subscription=subscription_id,
+                            status="paid",
+                            limit=100,
+                        ).auto_paging_iter()
+                        if int(invoice.get("amount_paid") or 0) > 0
+                        and (invoice.get("currency") or "").lower() == "gbp"
+                    ]
+                except stripe.StripeError as exc:
+                    print("Stripe invoice lookup failed:", exc)
+                    return HttpResponse(status=500)
+
+
+                # Stripe may briefly not show the current invoice in
+                # the paid-invoice list. Return 500 so Stripe can retry.
+                if not any(
+                    invoice.get("id") == invoice_id
+                    for invoice in paid_invoices
+                ):
+                    print(
+                        "Current paid invoice not found in Stripe invoice "
+                        "list; requesting webhook retry:",
+                        invoice_id,
+                    )
+                    return HttpResponse(status=500)
+
+                first_paid_invoice = min(
+                    paid_invoices,
+                    key=lambda invoice: (
+                        (invoice.get("status_transitions") or {}).get("paid_at")
+                        or invoice.get("created", 0),
+                        invoice.get("created", 0),
+                        invoice.get("id", ""),
+                    ),
+                )
+
+
+                if first_paid_invoice and first_paid_invoice.get("id") == invoice_id:
+                    payment_amount = Decimal(amount_paid) / Decimal("100")
+                    commission_amount = (
+                        payment_amount * Decimal("0.20")
+                    ).quantize(Decimal("0.01"))
+
+                    try:
+                        with transaction.atomic():
+                            AffiliateCommission.objects.create(
+                                affiliate=affiliate,
+                                referred_subscription=sub,
+                                stripe_invoice_id=invoice_id,
+                                payment_amount=payment_amount,
+                                commission_amount=commission_amount,
+                                status="earned",
+                            )
+                        print(
+                            "Affiliate commission recorded:",
+                            affiliate.code,
+                            commission_amount,
+                        )
+                    except IntegrityError:
+                        print(
+                            "Commission already recorded for this "
+                            "subscription or invoice."
+                        )
+                else:
+                    print(
+                        "No commission: this is not the first "
+                        "positive paid GBP invoice."
+                    )
+        else:
+            print(
+                "No commission: no positive GBP payment or "
+                "missing invoice/subscription ID."
+            )
+
 
     # =========================
     # SUBSCRIPTION CANCELLED
